@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 import streamlit as st
 from langchain_core.documents import Document
 
@@ -13,7 +15,6 @@ from rag_pipeline import (
 from utils import (
     build_document_set_id,
     format_chunk,
-    get_default_pdf_path,
     save_uploaded_pdf,
     uploaded_file_document_id,
 )
@@ -115,11 +116,19 @@ def render_chunks(chunks: list[dict], empty_message: str) -> None:
             preview = preview[:260].rstrip() + "..."
 
         score_text = f" | Similarity: {score:.4f}" if score is not None else ""
+        safe_filename = html.escape(str(filename))
+        safe_document_id = html.escape(str(document_id))
+        safe_page = html.escape(str(page))
+        safe_chunk_id = html.escape(str(chunk_id))
+        safe_preview = html.escape(preview)
         st.markdown(
             f"""
             <div class="chunk-box">
-                <div class="chunk-meta">{filename} | Page {page} | {chunk_id} | Doc ID: {document_id}{score_text}</div>
-                <div class="chunk-text">{preview}</div>
+                <div class="chunk-meta">
+                    {safe_filename} | Page {safe_page} | {safe_chunk_id} |
+                    Doc ID: {safe_document_id}{score_text}
+                </div>
+                <div class="chunk-text">{safe_preview}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -225,8 +234,8 @@ def main() -> None:
     st.markdown(
         """
         <div class="app-note">
-            Upload a PDF about Paracetamol, retrieve the most relevant chunks with FAISS,
-            and generate grounded answers using a Hugging Face model through LangChain.
+            Upload one or more PDFs, retrieve the most relevant chunks with FAISS,
+            and generate grounded answers with citations using a local Hugging Face model.
         </div>
         """,
         unsafe_allow_html=True,
@@ -270,14 +279,10 @@ def main() -> None:
     uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
     register_uploaded_documents(uploaded_files)
     active_documents = render_uploaded_document_list()
-    default_pdf = get_default_pdf_path()
 
     if active_documents:
         pdf_paths = [document["path"] for document in active_documents]
         document_label = ", ".join(document["filename"] for document in active_documents)
-    elif not st.session_state.get("uploaded_documents") and default_pdf.exists():
-        pdf_paths = [default_pdf]
-        document_label = default_pdf.name
     else:
         pdf_paths = []
         document_label = None
@@ -330,7 +335,7 @@ def main() -> None:
 
     question = st.text_input(
         "Ask a question about the document",
-        placeholder="Example: What are the uses, dosage notes, or warnings mentioned for Paracetamol?",
+        placeholder="Example: What warnings, requirements, or conclusions are stated in the uploaded PDFs?",
     )
 
     ask_clicked = st.button("Ask Question", type="primary", use_container_width=True)
@@ -352,7 +357,11 @@ def main() -> None:
     )
 
     try:
-        with st.spinner("Indexing selected documents if needed, retrieving relevant chunks, and generating the answer..."):
+        spinner_text = (
+            "Indexing selected documents if needed, retrieving relevant chunks, "
+            "and generating the answer..."
+        )
+        with st.spinner(spinner_text):
             ingestion_info = ensure_documents_ingested(
                 pipeline,
                 pdf_paths,
@@ -385,8 +394,9 @@ def main() -> None:
             )
 
     st.subheader("Final Answer")
+    safe_answer = html.escape(result["answer"]).replace("\n", "<br>")
     st.markdown(
-        f'<div class="answer-box">{result["answer"]}</div>',
+        f'<div class="answer-box">{safe_answer}</div>',
         unsafe_allow_html=True,
     )
 

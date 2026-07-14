@@ -156,8 +156,8 @@ class MultiDocumentRAGTest(TestCase):
                 self.assertTrue(chunk["metadata"]["document_id"])
 
             self.assertEqual(
-                build_document_set_id([aspirin_pdf, ibuprofen_pdf], 400, 50, top_k=2),
-                build_document_set_id([aspirin_pdf, ibuprofen_pdf], 400, 50, top_k=5),
+                build_document_set_id([aspirin_pdf, ibuprofen_pdf], 400, 50),
+                build_document_set_id([aspirin_pdf, ibuprofen_pdf], 400, 50),
             )
 
     def test_no_answer_threshold_skips_llm_for_unrelated_question(self) -> None:
@@ -276,6 +276,41 @@ class MultiDocumentRAGTest(TestCase):
 
             self.assertGreaterEqual(evidence[0].score, evidence[1].score)
             self.assertEqual(evidence[0].document.metadata["filename"], "aspirin.pdf")
+
+    def test_lexical_bonus_is_generic_and_bounded(self) -> None:
+        pipeline = RAGPipeline.__new__(RAGPipeline)
+        pipeline.indexed_chunks = [
+            Document(
+                page_content="Paracetamol may reduce fever and relieve mild pain.",
+                metadata={"filename": "usage.pdf", "page_number": 1, "chunk_id": "chunk_001"},
+            ),
+            Document(
+                page_content="Storage instructions say to keep medicines away from moisture.",
+                metadata={"filename": "storage.pdf", "page_number": 1, "chunk_id": "chunk_001"},
+            ),
+        ]
+
+        candidates = [
+            RetrievalChunk(
+                document=pipeline.indexed_chunks[1],
+                score=0.30,
+            )
+        ]
+
+        expanded = pipeline._add_lexical_candidates("What does paracetamol say about fever?", candidates)
+        ranked = sorted(expanded, key=lambda item: item.score, reverse=True)
+
+        self.assertEqual(ranked[0].document.metadata["filename"], "storage.pdf")
+        self.assertTrue(
+            any(item.document.metadata["filename"] == "usage.pdf" for item in expanded)
+        )
+        self.assertLessEqual(
+            RAGPipeline._lexical_relevance_bonus(
+                "What does paracetamol say about fever?",
+                "Paracetamol may reduce fever and relieve mild pain.",
+            ),
+            0.20,
+        )
 
     def test_contradictory_documents_remain_grounded_in_sources(self) -> None:
         with TemporaryDirectory() as tmp_dir:

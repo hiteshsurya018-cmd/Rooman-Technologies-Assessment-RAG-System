@@ -11,7 +11,6 @@ from langchain_core.documents import Document
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
-DEFAULT_PDF_PATH = DATA_DIR / "paracetamol.pdf"
 
 
 def ensure_data_dir() -> Path:
@@ -25,11 +24,6 @@ def ensure_uploads_dir() -> Path:
     ensure_data_dir()
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     return UPLOADS_DIR
-
-
-def get_default_pdf_path() -> Path:
-    """Return the default project PDF path."""
-    return DEFAULT_PDF_PATH
 
 
 def uploaded_file_document_id(uploaded_file) -> str:
@@ -58,23 +52,10 @@ def save_uploaded_pdf(uploaded_file, document_id: str | None = None) -> Path:
     return target_path
 
 
-def build_document_id(
-    file_path: Path,
-    chunk_size: int,
-    chunk_overlap: int,
-    top_k: int | None = None,
-) -> str:
-    """Create a stable identifier for the current document and chunking settings."""
-    stat = file_path.stat()
-    identity = f"{file_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{chunk_size}|{chunk_overlap}"
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-
 def build_document_set_id(
     file_paths: Iterable[Path],
     chunk_size: int,
     chunk_overlap: int,
-    top_k: int | None = None,
 ) -> str:
     """Create a stable identifier for a set of documents and chunking settings."""
     identities: list[str] = []

@@ -1,0 +1,38 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local app/runtime output
+*.log
+streamlit.log
+streamlit.err.log
+.streamlit/
+
+# Uploaded or generated local documents
+data/
+uploads/
+generated_reports/
+reports/
+screenshots/
+
+# Browser automation profiles
+.chrome-pdf-profile/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+

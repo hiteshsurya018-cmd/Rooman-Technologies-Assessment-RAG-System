@@ -6,6 +6,7 @@ from langchain_core.documents import Document
 from rag_pipeline import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_SIMILARITY_THRESHOLD,
     DEFAULT_TOP_K,
     RAGPipeline,
 )
@@ -133,6 +134,7 @@ def ensure_documents_ingested(
     chunk_size: int,
     chunk_overlap: int,
     top_k: int,
+    similarity_threshold: float,
 ) -> dict:
     document_set_id = build_document_set_id(pdf_paths, chunk_size, chunk_overlap)
     current_id = st.session_state.get("current_document_set_id")
@@ -143,14 +145,16 @@ def ensure_documents_ingested(
         and pipeline.qa_chain is not None
         and pipeline.vectorstore is not None
     ):
-        pipeline.configure_retrieval(top_k)
+        pipeline.configure_retrieval(top_k, similarity_threshold)
         st.session_state["current_top_k"] = top_k
+        st.session_state["current_similarity_threshold"] = similarity_threshold
         return st.session_state["ingestion_info"]
 
-    pipeline.configure_retrieval(top_k)
+    pipeline.configure_retrieval(top_k, similarity_threshold)
     ingestion_info = pipeline.ingest_pdfs(pdf_paths)
     st.session_state["current_document_set_id"] = document_set_id
     st.session_state["current_top_k"] = top_k
+    st.session_state["current_similarity_threshold"] = similarity_threshold
     st.session_state["ingestion_info"] = ingestion_info
     return ingestion_info
 
@@ -158,6 +162,7 @@ def ensure_documents_ingested(
 def invalidate_cached_index() -> None:
     st.session_state.pop("current_document_set_id", None)
     st.session_state.pop("current_top_k", None)
+    st.session_state.pop("current_similarity_threshold", None)
     st.session_state.pop("ingestion_info", None)
 
 
@@ -253,6 +258,14 @@ def main() -> None:
             step=1,
             help="Number of chunks retrieved from FAISS before answer generation.",
         )
+        similarity_threshold = st.slider(
+            "Evidence threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=DEFAULT_SIMILARITY_THRESHOLD,
+            step=0.05,
+            help="The LLM is skipped unless at least one retrieved chunk exceeds this similarity score.",
+        )
 
     uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
     register_uploaded_documents(uploaded_files)
@@ -305,6 +318,7 @@ def main() -> None:
                         chunk_size,
                         chunk_overlap,
                         top_k,
+                        similarity_threshold,
                     )
             except Exception as exc:
                 st.exception(exc)
@@ -345,18 +359,23 @@ def main() -> None:
                 chunk_size,
                 chunk_overlap,
                 top_k,
+                similarity_threshold,
             )
             result = pipeline.answer_question(question.strip())
     except Exception as exc:
         st.exception(exc)
         return
 
-    st.success("Answer generated successfully.")
+    if result.get("llm_called"):
+        st.success("Answer generated successfully.")
+    else:
+        st.warning("No sufficiently relevant evidence was retrieved.")
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("Pages loaded", ingestion_info["num_pages"])
     metric_col2.metric("Chunks created", ingestion_info["num_chunks"])
     metric_col3.metric("Top-k retrieved", top_k)
+    metric_col4.metric("Confidence", f"{result['confidence']}%")
 
     with st.expander("Indexed documents", expanded=False):
         for document in ingestion_info["documents"]:
@@ -374,7 +393,7 @@ def main() -> None:
     left_col, right_col = st.columns(2, gap="large")
 
     with left_col:
-        st.subheader("Retrieved Chunks")
+        st.subheader("Retrieved Evidence")
         render_chunks(result["retrieved_chunks"], "No retrieved chunks were returned.")
 
     with right_col:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,13 +27,25 @@ DEFAULT_GENERATION_MODEL = "google/flan-t5-base"
 DEFAULT_CHUNK_SIZE = 600
 DEFAULT_CHUNK_OVERLAP = 80
 DEFAULT_TOP_K = 3
-REFUSAL_ANSWER = "I could not find sufficient information in the provided sources."
+DEFAULT_SIMILARITY_THRESHOLD = 0.50
+DEFAULT_DUPLICATE_TEXT_THRESHOLD = 0.95
+REFUSAL_ANSWER = "I could not find sufficient information in the provided documents to answer this question."
+REFUSAL_REASON = "No sufficiently relevant evidence was retrieved."
 
 
 @dataclass
 class RetrievalChunk:
     document: Document
     score: float
+
+
+@dataclass
+class RetrievalAssessment:
+    chunks: list[RetrievalChunk]
+    confidence: int
+    has_sufficient_evidence: bool
+    threshold: float
+    reason: str | None = None
 
 
 class DiverseFAISSRetriever(BaseRetriever):
@@ -96,12 +109,16 @@ class RAGPipeline:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
         top_k: int = DEFAULT_TOP_K,
+        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+        duplicate_text_threshold: float = DEFAULT_DUPLICATE_TEXT_THRESHOLD,
     ) -> None:
         self.embedding_model_name = embedding_model_name
         self.generation_model_name = generation_model_name
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.top_k = top_k
+        self.similarity_threshold = similarity_threshold
+        self.duplicate_text_threshold = duplicate_text_threshold
 
         self.embeddings = self._build_embeddings()
         self.llm = self._build_llm()
@@ -151,8 +168,10 @@ class RAGPipeline:
     def _retrieval_fetch_k(self) -> int:
         return max(self.top_k, self.top_k * max(2, len(self.document_paths)) * 2)
 
-    def configure_retrieval(self, top_k: int) -> None:
+    def configure_retrieval(self, top_k: int, similarity_threshold: float | None = None) -> None:
         self.top_k = top_k
+        if similarity_threshold is not None:
+            self.similarity_threshold = similarity_threshold
         if self.vectorstore is None:
             self.qa_chain = None
             return
@@ -247,6 +266,7 @@ class RAGPipeline:
             "num_chunks": self.chunk_count,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
+            "similarity_threshold": self.similarity_threshold,
             "embedding_model": self.embedding_model_name,
             "generation_model": self.generation_model_name,
         }
@@ -254,16 +274,70 @@ class RAGPipeline:
     def retrieve_chunks(self, question: str) -> list[RetrievalChunk]:
         if self.vectorstore is None:
             raise ValueError("No vector store available. Ingest a PDF first.")
+        if not question.strip():
+            return []
 
-        results = self.vectorstore.similarity_search_with_score(
-            question,
-            k=self._retrieval_fetch_k(),
-        )
+        results = self._retrieve_with_mmr_if_supported(question)
         candidates = [
-            RetrievalChunk(document=doc, score=1.0 / (1.0 + float(score)))
+            RetrievalChunk(document=doc, score=self._normalize_similarity_score(score))
             for doc, score in results
         ]
-        return self._select_diverse_chunks(candidates)
+        ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
+        deduplicated = self._remove_near_duplicate_chunks(ranked)
+        selected = self._select_diverse_chunks(deduplicated)
+        return sorted(selected, key=lambda item: item.score, reverse=True)
+
+    def _retrieve_with_mmr_if_supported(self, question: str) -> list[tuple[Document, float]]:
+        fetch_k = self._retrieval_fetch_k()
+        mmr_method = getattr(self.vectorstore, "max_marginal_relevance_search_with_score_by_vector", None)
+        if callable(mmr_method):
+            query_embedding = self.embeddings.embed_query(question)
+            return mmr_method(
+                query_embedding,
+                k=fetch_k,
+                fetch_k=max(fetch_k * 2, 20),
+                lambda_mult=0.5,
+            )
+
+        return self.vectorstore.similarity_search_with_score(
+            question,
+            k=fetch_k,
+            fetch_k=fetch_k,
+        )
+
+    @staticmethod
+    def _normalize_similarity_score(raw_score: float) -> float:
+        distance = max(float(raw_score), 0.0)
+        return max(0.0, min(1.0, 1.0 / (1.0 + distance)))
+
+    def _remove_near_duplicate_chunks(self, candidates: list[RetrievalChunk]) -> list[RetrievalChunk]:
+        unique_chunks: list[RetrievalChunk] = []
+        normalized_texts: list[str] = []
+
+        for candidate in candidates:
+            normalized = self._normalize_text(candidate.document.page_content)
+            if not normalized:
+                continue
+            is_duplicate = any(
+                self._text_similarity(normalized, existing) >= self.duplicate_text_threshold
+                for existing in normalized_texts
+            )
+            if is_duplicate:
+                continue
+            unique_chunks.append(candidate)
+            normalized_texts.append(normalized)
+
+        return unique_chunks
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    @staticmethod
+    def _text_similarity(left: str, right: str) -> float:
+        if left == right:
+            return 1.0
+        return SequenceMatcher(None, left, right).ratio()
 
     def _select_diverse_chunks(self, candidates: list[RetrievalChunk]) -> list[RetrievalChunk]:
         if len(self.document_paths) <= 1:
@@ -303,6 +377,10 @@ class RAGPipeline:
             raise ValueError("QA chain is not initialized. Ingest a PDF first.")
 
         retrieved_chunks = self.retrieve_chunks(question)
+        assessment = self.assess_retrieval(retrieved_chunks)
+        if not assessment.has_sufficient_evidence:
+            return self._no_answer_response(assessment)
+
         response = self.qa_chain.invoke({"query": question})
         source_documents = deduplicate_documents(response.get("source_documents", []))
 
@@ -319,6 +397,10 @@ class RAGPipeline:
 
         return {
             "answer": answer,
+            "confidence": assessment.confidence,
+            "similarity_threshold": assessment.threshold,
+            "reason": assessment.reason,
+            "llm_called": True,
             "retrieved_chunks": [self._serialize_chunk(item.document, item.score) for item in retrieved_chunks],
             "source_documents": [
                 self._serialize_chunk(
@@ -333,6 +415,41 @@ class RAGPipeline:
                 )
                 for doc in source_documents
             ],
+        }
+
+    def assess_retrieval(self, chunks: list[RetrievalChunk]) -> RetrievalAssessment:
+        confidence = self.calculate_confidence(chunks)
+        has_sufficient_evidence = any(chunk.score > self.similarity_threshold for chunk in chunks)
+        return RetrievalAssessment(
+            chunks=chunks,
+            confidence=confidence,
+            has_sufficient_evidence=has_sufficient_evidence,
+            threshold=self.similarity_threshold,
+            reason=None if has_sufficient_evidence else REFUSAL_REASON,
+        )
+
+    @staticmethod
+    def calculate_confidence(chunks: list[RetrievalChunk]) -> int:
+        if not chunks:
+            return 0
+
+        scores = [max(0.0, min(1.0, chunk.score)) for chunk in chunks]
+        top_score = max(scores)
+        average_score = sum(scores) / len(scores)
+        confidence = (0.70 * top_score) + (0.30 * average_score)
+        return round(confidence * 100)
+
+    def _no_answer_response(self, assessment: RetrievalAssessment) -> dict[str, Any]:
+        return {
+            "answer": f"{REFUSAL_ANSWER}\n\nReason:\n{REFUSAL_REASON}",
+            "confidence": assessment.confidence,
+            "similarity_threshold": assessment.threshold,
+            "reason": REFUSAL_REASON,
+            "llm_called": False,
+            "retrieved_chunks": [
+                self._serialize_chunk(item.document, item.score) for item in assessment.chunks
+            ],
+            "source_documents": [],
         }
 
     def _ensure_inline_citations(self, answer: str, source_documents: list[Document]) -> str:

@@ -27,11 +27,13 @@ Independent PDF loading and chunking
     |
 Single FAISS Vector DB
     |
-Document-diverse top-k relevant chunks
+MMR candidate retrieval + ranked evidence filtering
+    |
+Confidence and evidence threshold check
     |
 LLM generates answer using context
     |
-Return cited answer + source chunks
+Return cited answer + source chunks, or no-answer response
 ```
 
 ## Chunking Strategy
@@ -63,10 +65,14 @@ Embeddings are essential in RAG because semantic search depends on them. Once bo
 4. Convert each chunk into an embedding using `all-MiniLM-L6-v2`.
 5. Store all vectors from all selected PDFs in one FAISS index.
 6. Embed the user question.
-7. Retrieve a larger candidate set from FAISS, then select the final top-k chunks with a document-diverse policy so one document does not dominate multi-document queries when other relevant sources are available.
-8. Pass those chunks to a LangChain `RetrievalQA` chain.
-9. Generate an answer constrained to the retrieved context.
-10. Return the final answer with inline citations and the source chunks used.
+7. Retrieve a larger candidate set from FAISS using Max Marginal Relevance when the installed LangChain FAISS integration supports it. If MMR is unavailable, the pipeline falls back to FAISS similarity search.
+8. Convert FAISS distances into normalized similarity scores from `0.0` to `1.0`.
+9. Sort evidence by similarity, remove near-duplicate chunks, then apply the document-diverse top-k selection policy.
+10. Compute a retrieval confidence score and check the evidence threshold before calling the LLM.
+11. If no chunk exceeds the threshold, skip the LLM and return the no-answer message.
+12. If evidence is sufficient, pass those chunks to a LangChain `RetrievalQA` chain.
+13. Generate an answer constrained to the retrieved context.
+14. Return the final answer with inline citations, confidence, and the source chunks used.
 
 ## Streamlit Features
 
@@ -81,14 +87,15 @@ The app includes:
 - Ask Question button
 - loading spinner
 - final answer display with inline citations
-- retrieved chunk display
+- retrieval confidence display
+- ranked retrieved evidence display
 - source chunk display
 - similarity score display for each retrieved chunk
 
 ## Implementation Notes
 
 - `app.py` contains the Streamlit interface and avoids re-indexing the same document set on every question by caching ingestion state. Changing top-k reuses the current FAISS index; changing active PDFs or chunking settings rebuilds it.
-- `rag_pipeline.py` contains the end-to-end RAG pipeline using LangChain, Hugging Face embeddings, FAISS, and a LangChain `RetrievalQA` chain. It processes each PDF independently, then combines the chunks into one searchable index. The QA chain uses the same document-diverse retriever as the evidence panel so citations and displayed chunks stay aligned.
+- `rag_pipeline.py` contains the end-to-end RAG pipeline using LangChain, Hugging Face embeddings, FAISS, and a LangChain `RetrievalQA` chain. It processes each PDF independently, then combines the chunks into one searchable index. The QA chain uses the same MMR-backed, document-diverse retriever as the evidence panel so citations and displayed chunks stay aligned.
 - `utils.py` contains helper functions for saving uploads, formatting chunks, and tracking the active document configuration.
 - The default generation model is `google/flan-t5-base`, loaded locally through `transformers`.
 
@@ -126,6 +133,33 @@ The source evidence panel also displays the document id, page number, chunk id, 
 
 The FAISS index is reused when the active document set, file contents, chunk size, and chunk overlap are unchanged. Changing top-k only reconfigures retrieval and does not recompute embeddings. Removing or restoring a document, uploading a new PDF, or changing chunking settings marks the index for rebuild.
 
+## Retrieval Confidence and No-Answer Behavior
+
+The app computes confidence from retrieval scores, not from the generated answer. FAISS returns distance scores where lower is better, so the pipeline normalizes each retrieved chunk with:
+
+```text
+similarity = 1 / (1 + distance)
+```
+
+The displayed confidence is a weighted retrieval-quality score:
+
+```text
+confidence = 70% * best retrieved similarity + 30% * average retrieved similarity
+```
+
+The sidebar evidence threshold controls hallucination prevention. Before the LLM is called, at least one retrieved chunk must have a similarity score greater than the threshold. If no chunk exceeds the threshold, the LLM is skipped and the app returns:
+
+```text
+I could not find sufficient information in the provided documents to answer this question.
+
+Reason:
+No sufficiently relevant evidence was retrieved.
+```
+
+This behavior applies to unrelated, empty, and nonsense questions. For contradictory documents, the system still answers only from retrieved context and cites the supporting chunks so the disagreement remains visible in the evidence.
+
+Retrieved evidence is always displayed in descending similarity order and includes similarity score, filename, page, chunk id, document id, and preview text. Near-duplicate chunks are removed before final evidence selection; when chunks are nearly identical, the highest-scoring chunk is kept.
+
 ## Verification
 
 Run the multi-document regression test with:
@@ -134,7 +168,7 @@ Run the multi-document regression test with:
 python -m unittest discover -s tests -v
 ```
 
-The test creates two different PDFs, builds one FAISS index across both, asks a query that mentions both documents, and checks that retrieval, source documents, metadata, and inline citation labels include both PDFs.
+The tests create synthetic PDFs, build one FAISS index across documents, and check multi-document retrieval, source metadata, inline citation labels, no-answer threshold behavior, duplicate chunk removal, confidence score calculation, ranked evidence ordering, empty/nonsense questions, and contradictory-document grounding.
 
 ## Error Handling
 

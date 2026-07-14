@@ -11,12 +11,14 @@ __pycache__/
 venv/
 env/
 ENV/
+.env
 
 # Local app/runtime output
 *.log
 streamlit.log
 streamlit.err.log
 .streamlit/
+.agents/
 
 # Uploaded or generated local documents
 data/
@@ -35,4 +37,3 @@ screenshots/
 *.swo
 .DS_Store
 Thumbs.db
-

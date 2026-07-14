@@ -165,7 +165,6 @@ No sufficiently relevant evidence was retrieved.
 |-- .gitignore
 |-- README.md
 |-- ASSESSMENT.md
-|-- LICENSE
 |-- sample_questions.md
 |-- expected_outputs.md
 |-- sample_docs/
@@ -243,10 +242,6 @@ streamlit run app.py
 ```
 
 Upload both sample PDFs and verify that supported questions receive cited answers, while unsupported questions refuse.
-
-## License
-
-This repository is provided under the MIT License. See `LICENSE`.
 
 ## Reviewer Notes
 

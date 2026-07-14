@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,9 +8,11 @@ from typing import Any
 from langchain_classic.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.language_models.llms import LLM
 from langchain_core.prompts import PromptTemplate
+from langchain_core.retrievers import BaseRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import ConfigDict, PrivateAttr
@@ -30,6 +33,21 @@ REFUSAL_ANSWER = "I could not find sufficient information in the provided source
 class RetrievalChunk:
     document: Document
     score: float
+
+
+class DiverseFAISSRetriever(BaseRetriever):
+    """Retriever that applies the pipeline's cross-document selection policy."""
+
+    pipeline: Any
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun,
+    ) -> list[Document]:
+        return [item.document for item in self.pipeline.retrieve_chunks(query)]
 
 
 class LocalSeq2SeqLLM(LLM):
@@ -90,6 +108,7 @@ class RAGPipeline:
         self.vectorstore: FAISS | None = None
         self.qa_chain: RetrievalQA | None = None
         self.document_path: Path | None = None
+        self.document_paths: list[Path] = []
         self.page_count = 0
         self.chunk_count = 0
 
@@ -129,11 +148,39 @@ class RAGPipeline:
             input_variables=["page_content", "filename", "page_number", "chunk_id"],
         )
 
-    def load_and_split_documents(self, pdf_path: str | Path) -> list[Document]:
+    def _retrieval_fetch_k(self) -> int:
+        return max(self.top_k, self.top_k * max(2, len(self.document_paths)) * 2)
+
+    def configure_retrieval(self, top_k: int) -> None:
+        self.top_k = top_k
+        if self.vectorstore is None:
+            self.qa_chain = None
+            return
+
+        retriever = DiverseFAISSRetriever(pipeline=self)
+        self.qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True,
+            chain_type_kwargs={
+                "prompt": self._build_prompt(),
+                "document_prompt": self._build_document_prompt(),
+            },
+        )
+
+    def _document_id_for_path(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()[:12]
+
+    def load_and_split_documents(self, pdf_path: str | Path, document_id: str | None = None) -> list[Document]:
         path = Path(pdf_path)
         loader = PyPDFLoader(str(path))
         documents = loader.load()
-        self.page_count = len(documents)
+        document_id = document_id or self._document_id_for_path(path)
 
         # Recursive splitting preserves paragraphs and sentences before falling back to words.
         splitter = RecursiveCharacterTextSplitter(
@@ -150,37 +197,52 @@ class RAGPipeline:
                     "filename": path.name,
                     "page_number": page_number if page_number is not None else "N/A",
                     "chunk_id": f"chunk_{index:03d}",
+                    "document_id": document_id,
                 }
             )
-        self.chunk_count = len(chunks)
         return chunks
 
     def ingest_pdf(self, pdf_path: str | Path) -> dict[str, Any]:
-        self.document_path = Path(pdf_path)
-        chunks = self.load_and_split_documents(pdf_path)
+        return self.ingest_pdfs([pdf_path])
 
-        if not chunks:
-            raise ValueError("The provided PDF did not produce any text chunks.")
+    def ingest_pdfs(self, pdf_paths: list[str | Path]) -> dict[str, Any]:
+        paths = [Path(pdf_path) for pdf_path in pdf_paths]
+        if not paths:
+            raise ValueError("At least one PDF is required to build the index.")
 
-        # Build a fresh FAISS index for the selected PDF.
-        self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
-        retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": self.top_k},
-        )
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=True,
-            chain_type_kwargs={
-                "prompt": self._build_prompt(),
-                "document_prompt": self._build_document_prompt(),
-            },
-        )
+        self.document_path = paths[0]
+        self.document_paths = paths
+
+        all_chunks: list[Document] = []
+        document_summaries: list[dict[str, Any]] = []
+
+        for path in paths:
+            document_id = self._document_id_for_path(path)
+            chunks = self.load_and_split_documents(path, document_id=document_id)
+            all_chunks.extend(chunks)
+            page_numbers = {chunk.metadata.get("page") for chunk in chunks}
+            document_summaries.append(
+                {
+                    "filename": path.name,
+                    "document_id": document_id,
+                    "num_pages": len(page_numbers),
+                    "num_chunks": len(chunks),
+                }
+            )
+
+        if not all_chunks:
+            raise ValueError("The provided PDFs did not produce any text chunks.")
+
+        self.page_count = sum(int(item["num_pages"]) for item in document_summaries)
+        self.chunk_count = len(all_chunks)
+
+        # Build one FAISS index over chunks from every selected document.
+        self.vectorstore = FAISS.from_documents(all_chunks, self.embeddings)
+        self.configure_retrieval(self.top_k)
 
         return {
-            "document_path": str(self.document_path),
+            "document_paths": [str(path) for path in self.document_paths],
+            "documents": document_summaries,
             "num_pages": self.page_count,
             "num_chunks": self.chunk_count,
             "chunk_size": self.chunk_size,
@@ -195,12 +257,46 @@ class RAGPipeline:
 
         results = self.vectorstore.similarity_search_with_score(
             question,
-            k=self.top_k,
+            k=self._retrieval_fetch_k(),
         )
-        return [
+        candidates = [
             RetrievalChunk(document=doc, score=1.0 / (1.0 + float(score)))
             for doc, score in results
         ]
+        return self._select_diverse_chunks(candidates)
+
+    def _select_diverse_chunks(self, candidates: list[RetrievalChunk]) -> list[RetrievalChunk]:
+        if len(self.document_paths) <= 1:
+            return candidates[: self.top_k]
+
+        selected: list[RetrievalChunk] = []
+        selected_keys: set[tuple[str, str]] = set()
+        seen_documents: set[str] = set()
+
+        for candidate in candidates:
+            document_id = str(candidate.document.metadata.get("document_id", ""))
+            key = (document_id, str(candidate.document.metadata.get("chunk_id", "")))
+            if document_id in seen_documents:
+                continue
+            selected.append(candidate)
+            selected_keys.add(key)
+            seen_documents.add(document_id)
+            if len(selected) >= min(self.top_k, len(self.document_paths)):
+                break
+
+        for candidate in candidates:
+            key = (
+                str(candidate.document.metadata.get("document_id", "")),
+                str(candidate.document.metadata.get("chunk_id", "")),
+            )
+            if key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(key)
+            if len(selected) == self.top_k:
+                break
+
+        return selected
 
     def answer_question(self, question: str) -> dict[str, Any]:
         if self.qa_chain is None:
@@ -211,7 +307,11 @@ class RAGPipeline:
         source_documents = deduplicate_documents(response.get("source_documents", []))
 
         score_lookup = {
-            (item.document.page_content, str(item.document.metadata.get("page", ""))): item.score
+            (
+                item.document.page_content,
+                str(item.document.metadata.get("document_id", "")),
+                str(item.document.metadata.get("chunk_id", "")),
+            ): item.score
             for item in retrieved_chunks
         }
 
@@ -223,7 +323,13 @@ class RAGPipeline:
             "source_documents": [
                 self._serialize_chunk(
                     doc,
-                    score_lookup.get((doc.page_content, str(doc.metadata.get("page", "")))),
+                    score_lookup.get(
+                        (
+                            doc.page_content,
+                            str(doc.metadata.get("document_id", "")),
+                            str(doc.metadata.get("chunk_id", "")),
+                        )
+                    ),
                 )
                 for doc in source_documents
             ],

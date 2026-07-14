@@ -9,7 +9,13 @@ from rag_pipeline import (
     DEFAULT_TOP_K,
     RAGPipeline,
 )
-from utils import build_document_id, format_chunk, get_default_pdf_path, save_uploaded_pdf
+from utils import (
+    build_document_set_id,
+    format_chunk,
+    get_default_pdf_path,
+    save_uploaded_pdf,
+    uploaded_file_document_id,
+)
 
 
 st.set_page_config(
@@ -73,12 +79,10 @@ MINIMAL_CSS = """
 def get_pipeline(
     chunk_size: int,
     chunk_overlap: int,
-    top_k: int,
 ) -> RAGPipeline:
     return RAGPipeline(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        top_k=top_k,
     )
 
 
@@ -98,8 +102,11 @@ def render_chunks(chunks: list[dict], empty_message: str) -> None:
     for index, chunk in enumerate(chunks, start=1):
         metadata = chunk.get("metadata", {})
         filename = metadata.get("filename", "source")
-        raw_page = metadata.get("page_number", metadata.get("page", "N/A"))
-        page = raw_page + 1 if isinstance(raw_page, int) else raw_page
+        document_id = metadata.get("document_id", "unknown")
+        page = metadata.get("page_number")
+        if page is None:
+            raw_page = metadata.get("page", "N/A")
+            page = raw_page + 1 if isinstance(raw_page, int) else raw_page
         chunk_id = metadata.get("chunk_id", f"chunk_{index:03d}")
         score = chunk.get("score")
         preview = chunk.get("content", "").strip()
@@ -110,7 +117,7 @@ def render_chunks(chunks: list[dict], empty_message: str) -> None:
         st.markdown(
             f"""
             <div class="chunk-box">
-                <div class="chunk-meta">{filename} | Page {page} | {chunk_id}{score_text}</div>
+                <div class="chunk-meta">{filename} | Page {page} | {chunk_id} | Doc ID: {document_id}{score_text}</div>
                 <div class="chunk-text">{preview}</div>
             </div>
             """,
@@ -120,28 +127,91 @@ def render_chunks(chunks: list[dict], empty_message: str) -> None:
             st.text(format_chunk_payload(chunk))
 
 
-def ensure_document_ingested(
+def ensure_documents_ingested(
     pipeline: RAGPipeline,
-    pdf_path,
+    pdf_paths: list,
     chunk_size: int,
     chunk_overlap: int,
     top_k: int,
 ) -> dict:
-    document_id = build_document_id(pdf_path, chunk_size, chunk_overlap, top_k)
-    current_id = st.session_state.get("current_document_id")
+    document_set_id = build_document_set_id(pdf_paths, chunk_size, chunk_overlap)
+    current_id = st.session_state.get("current_document_set_id")
 
     if (
-        current_id == document_id
+        current_id == document_set_id
         and st.session_state.get("ingestion_info")
         and pipeline.qa_chain is not None
         and pipeline.vectorstore is not None
     ):
+        pipeline.configure_retrieval(top_k)
+        st.session_state["current_top_k"] = top_k
         return st.session_state["ingestion_info"]
 
-    ingestion_info = pipeline.ingest_pdf(pdf_path)
-    st.session_state["current_document_id"] = document_id
+    pipeline.configure_retrieval(top_k)
+    ingestion_info = pipeline.ingest_pdfs(pdf_paths)
+    st.session_state["current_document_set_id"] = document_set_id
+    st.session_state["current_top_k"] = top_k
     st.session_state["ingestion_info"] = ingestion_info
     return ingestion_info
+
+
+def invalidate_cached_index() -> None:
+    st.session_state.pop("current_document_set_id", None)
+    st.session_state.pop("current_top_k", None)
+    st.session_state.pop("ingestion_info", None)
+
+
+def register_uploaded_documents(uploaded_files) -> None:
+    st.session_state.setdefault("uploaded_documents", {})
+    st.session_state.setdefault("active_document_ids", set())
+
+    for uploaded_file in uploaded_files or []:
+        document_id = uploaded_file_document_id(uploaded_file)
+        if document_id in st.session_state["uploaded_documents"]:
+            continue
+
+        saved_path = save_uploaded_pdf(uploaded_file, document_id=document_id)
+        st.session_state["uploaded_documents"][document_id] = {
+            "document_id": document_id,
+            "filename": uploaded_file.name,
+            "path": saved_path,
+            "size": uploaded_file.size,
+        }
+        st.session_state["active_document_ids"].add(document_id)
+        invalidate_cached_index()
+
+
+def render_uploaded_document_list() -> list[dict]:
+    documents = st.session_state.get("uploaded_documents", {})
+    active_ids = st.session_state.setdefault("active_document_ids", set())
+
+    if not documents:
+        return []
+
+    st.subheader("Uploaded Documents")
+    for document_id, document in documents.items():
+        is_active = document_id in active_ids
+        status = "Active" if is_active else "Removed"
+        col1, col2, col3, col4 = st.columns([4, 2, 2, 2])
+        col1.write(document["filename"])
+        col2.write(f"{document['size'] / 1024:.1f} KB")
+        col3.write(status)
+        if is_active:
+            if col4.button("Remove", key=f"remove_{document_id}"):
+                active_ids.remove(document_id)
+                invalidate_cached_index()
+                st.rerun()
+        else:
+            if col4.button("Restore", key=f"restore_{document_id}"):
+                active_ids.add(document_id)
+                invalidate_cached_index()
+                st.rerun()
+
+    return [
+        document
+        for document_id, document in documents.items()
+        if document_id in active_ids
+    ]
 
 
 def main() -> None:
@@ -184,23 +254,65 @@ def main() -> None:
             help="Number of chunks retrieved from FAISS before answer generation.",
         )
 
-    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+    uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    register_uploaded_documents(uploaded_files)
+    active_documents = render_uploaded_document_list()
     default_pdf = get_default_pdf_path()
 
-    if uploaded_file is not None:
-        pdf_path = save_uploaded_pdf(uploaded_file)
-        document_label = uploaded_file.name
-    elif default_pdf.exists():
-        pdf_path = default_pdf
+    if active_documents:
+        pdf_paths = [document["path"] for document in active_documents]
+        document_label = ", ".join(document["filename"] for document in active_documents)
+    elif not st.session_state.get("uploaded_documents") and default_pdf.exists():
+        pdf_paths = [default_pdf]
         document_label = default_pdf.name
     else:
-        pdf_path = None
+        pdf_paths = []
         document_label = None
 
     if document_label:
-        st.info(f"Selected document: {document_label}")
+        st.info(f"Selected documents: {document_label}")
     else:
-        st.warning("Upload a PDF to begin. No default PDF was found in the data folder.")
+        st.warning("Upload one or more PDFs to begin. No active documents are selected.")
+
+    document_set_id = build_document_set_id(pdf_paths, chunk_size, chunk_overlap) if pdf_paths else None
+    index_is_current = (
+        document_set_id is not None
+        and st.session_state.get("current_document_set_id") == document_set_id
+        and st.session_state.get("ingestion_info") is not None
+    )
+    if pdf_paths:
+        st.caption(
+            "Index status: current. Top-k changes will reuse the existing FAISS index."
+            if index_is_current
+            else "Index status: rebuild needed. The index will be built before retrieval."
+        )
+
+        rebuild_clicked = st.button(
+            "Build / Rebuild Index",
+            disabled=index_is_current,
+            use_container_width=True,
+        )
+        if rebuild_clicked:
+            pipeline = get_pipeline(
+                chunk_size,
+                chunk_overlap,
+            )
+            try:
+                with st.spinner("Building one FAISS index from all active PDFs..."):
+                    ingestion_info = ensure_documents_ingested(
+                        pipeline,
+                        pdf_paths,
+                        chunk_size,
+                        chunk_overlap,
+                        top_k,
+                    )
+            except Exception as exc:
+                st.exception(exc)
+                return
+            st.success(
+                f"Indexed {len(ingestion_info['documents'])} document(s) into "
+                f"{ingestion_info['num_chunks']} chunks."
+            )
 
     question = st.text_input(
         "Ask a question about the document",
@@ -212,8 +324,8 @@ def main() -> None:
     if not ask_clicked:
         return
 
-    if pdf_path is None:
-        st.error("Please upload a PDF or place `data/paracetamol.pdf` in the project before asking a question.")
+    if not pdf_paths:
+        st.error("Please select at least one PDF before asking a question.")
         return
 
     if not question.strip():
@@ -223,14 +335,13 @@ def main() -> None:
     pipeline = get_pipeline(
         chunk_size,
         chunk_overlap,
-        top_k,
     )
 
     try:
-        with st.spinner("Indexing the document, retrieving relevant chunks, and generating the answer..."):
-            ingestion_info = ensure_document_ingested(
+        with st.spinner("Indexing selected documents if needed, retrieving relevant chunks, and generating the answer..."):
+            ingestion_info = ensure_documents_ingested(
                 pipeline,
-                pdf_path,
+                pdf_paths,
                 chunk_size,
                 chunk_overlap,
                 top_k,
@@ -246,6 +357,13 @@ def main() -> None:
     metric_col1.metric("Pages loaded", ingestion_info["num_pages"])
     metric_col2.metric("Chunks created", ingestion_info["num_chunks"])
     metric_col3.metric("Top-k retrieved", top_k)
+
+    with st.expander("Indexed documents", expanded=False):
+        for document in ingestion_info["documents"]:
+            st.write(
+                f"{document['filename']} | pages: {document['num_pages']} | "
+                f"chunks: {document['num_chunks']} | document_id: {document['document_id']}"
+            )
 
     st.subheader("Final Answer")
     st.markdown(

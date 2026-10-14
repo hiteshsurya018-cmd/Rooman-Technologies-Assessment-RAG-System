@@ -21,7 +21,7 @@ from utils import (
 
 
 st.set_page_config(
-    page_title="Paracetamol RAG QA System",
+    page_title="Multi-Document RAG Research Agent with Citations",
     layout="wide",
 )
 
@@ -230,7 +230,7 @@ def render_uploaded_document_list() -> list[dict]:
 
 def main() -> None:
     st.markdown(MINIMAL_CSS, unsafe_allow_html=True)
-    st.title("Document Question Answering with RAG")
+    st.title("Multi-Document RAG Research Agent with Citations")
     st.markdown(
         """
         <div class="app-note">

@@ -1,4 +1,4 @@
-# Multi-Document Research Agent with Citations
+# Multi-Document RAG Research Agent with Citations
 
 ## Project Overview
 
